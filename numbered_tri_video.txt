@@ -1,0 +1,398 @@
+    1: # -*- coding: utf-8 -*-
+    2: """
+    3: Improved Two-cam triangulation with better matching and occlusion handling.
+    4: """
+    5: import argparse
+    6: import json
+    7: from pathlib import Path
+    8: from typing import List, Dict, Any, Tuple, Optional
+    9: import numpy as np
+   10: import cv2
+   11: from scipy.optimize import linear_sum_assignment
+   12: from scipy.spatial.distance import cdist
+   13: 
+   14: 
+   15: def load_json_video(path: str) -> List[List[Dict[str, np.ndarray]]]:
+   16:     """?ìƒ ?„ì²´ JSON???„ë ˆ??ë¦¬ìŠ¤?¸ë¡œ ë³€??"""
+   17:     p = Path(path)
+   18:     if p.is_dir():
+   19:         cand = p / "results_output_video.json"
+   20:         if not cand.exists():
+   21:             raise FileNotFoundError(f"Video JSON not found in directory: {p}")
+   22:         path = str(cand)
+   23: 
+   24:     with open(path, "r", encoding="utf-8") as f:
+   25:         data = json.load(f)
+   26: 
+   27:     raw_frames = None
+   28:     if isinstance(data, dict):
+   29:         if "instance_info" in data:
+   30:             raw_frames = data["instance_info"]
+   31:         elif "frames" in data:
+   32:             raw_frames = data["frames"]
+   33:     if raw_frames is None:
+   34:         raise ValueError("Unsupported JSON format.")
+   35: 
+   36:     frames: List[List[Dict[str, np.ndarray]]] = []
+   37:     for fr in raw_frames:
+   38:         insts = fr.get("instances", fr.get("objects", []))
+   39:         people = []
+   40:         for inst in insts:
+   41:             k = inst.get("keypoints") or inst.get("keypoints_2d")
+   42:             if k is None:
+   43:                 continue
+   44:             k = np.asarray(k, dtype=np.float32)
+   45: 
+   46:             if k.ndim == 1:
+   47:                 J = 17 if (k.size % 17 == 0) else (k.size // 3)
+   48:                 if k.size == J * 3:
+   49:                     k = k.reshape(J, 3)[:, :2]
+   50:                 elif k.size == J * 2:
+   51:                     k = k.reshape(J, 2)
+   52:                 else:
+   53:                     continue
+   54:             elif k.ndim == 2:
+   55:                 if k.shape[1] >= 2:
+   56:                     k = k[:, :2]
+   57:                 else:
+   58:                     continue
+   59:             else:
+   60:                 continue
+   61: 
+   62:             s = inst.get("keypoint_scores", inst.get("scores"))
+   63:             if s is None:
+   64:                 scores = np.ones((k.shape[0],), dtype=np.float32)
+   65:             else:
+   66:                 s = np.asarray(s, dtype=np.float32)
+   67:                 if s.ndim == 1:
+   68:                     scores = s
+   69:                 elif s.ndim == 2 and s.shape[1] >= 1:
+   70:                     scores = s[:, 0]
+   71:                 else:
+   72:                     scores = np.ones((k.shape[0],), dtype=np.float32)
+   73: 
+   74:             people.append({"keypoints": k, "scores": scores})
+   75:         frames.append(people)
+   76: 
+   77:     return frames
+   78: 
+   79: 
+   80: def parse_calib(calib_path: str, extrinsic_format: str) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+   81:     """ìº˜ë¦¬ë¸?JSON ??(K0,d0,K1,d1,R_rel,t_rel)"""
+   82:     def _arr(d, *keys):
+   83:         for k in keys:
+   84:             if k in d:
+   85:                 return np.asarray(d[k], dtype=np.float64)
+   86:         raise KeyError(keys)
+   87: 
+   88:     with open(calib_path, "r", encoding="utf-8") as f:
+   89:         cj = json.load(f)
+   90: 
+   91:     cams = cj.get("cameras", cj.get("Cameras"))
+   92:     if cams is None or len(cams) < 2:
+   93:         raise ValueError("Calibration JSON must have at least two cameras.")
+   94: 
+   95:     c0, c1 = cams[0], cams[1]
+   96:     K0 = _arr(c0, "K", "camera_matrix", "intrinsic")
+   97:     K1 = _arr(c1, "K", "camera_matrix", "intrinsic")
+   98:     d0 = _arr(c0, "dist", "distCoef", "distCoeffs").ravel()
+   99:     d1 = _arr(c1, "dist", "distCoef", "distCoeffs").ravel()
+  100:     R0 = _arr(c0, "R")
+  101:     t0 = _arr(c0, "t", "T").ravel()
+  102:     R1 = _arr(c1, "R")
+  103:     t1 = _arr(c1, "t", "T").ravel()
+  104: 
+  105:     if extrinsic_format.lower() == "c2w":
+  106:         def c2w_to_w2c(Rcw, tcw):
+  107:             Rwc = Rcw.T
+  108:             twc = -Rcw.T @ tcw
+  109:             return Rwc, twc
+  110:         R0, t0 = c2w_to_w2c(R0, t0)
+  111:         R1, t1 = c2w_to_w2c(R1, t1)
+  112: 
+  113:     Rrel = R1 @ np.linalg.inv(R0)
+  114:     trel = t1 - R1 @ np.linalg.inv(R0) @ t0
+  115:     return K0, d0, K1, d1, Rrel, trel
+  116: 
+  117: 
+  118: def undistort_pts(pts: np.ndarray, K: np.ndarray, dist: np.ndarray) -> np.ndarray:
+  119:     if pts.size == 0:
+  120:         return pts.copy()
+  121:     pts = pts.reshape(-1, 1, 2).astype(np.float32)
+  122:     und = cv2.undistortPoints(pts, cameraMatrix=K, distCoeffs=dist.astype(np.float64), P=K)
+  123:     return und.reshape(-1, 2)
+  124: 
+  125: 
+  126: def triangulate_robust(P0: np.ndarray, P1: np.ndarray, p0: np.ndarray, p1: np.ndarray) -> np.ndarray:
+  127:     """Robust triangulation with outlier filtering"""
+  128:     if p0.shape[0] == 0:
+  129:         return np.array([]).reshape(0, 3)
+  130:     
+  131:     X_h = cv2.triangulatePoints(P0, P1, p0.T, p1.T)
+  132:     X = (X_h[:3] / X_h[3]).T
+  133:     
+  134:     # Filter out points that are too far behind the camera or too far away
+  135:     valid_mask = (X_h[3] > 0.1) & (np.linalg.norm(X, axis=1) < 10.0)
+  136:     
+  137:     return X, valid_mask
+  138: 
+  139: 
+  140: def compute_pose_similarity(pose1: np.ndarray, pose2: np.ndarray, scores1: np.ndarray, scores2: np.ndarray) -> float:
+  141:     """???¬ì¦ˆ ê°„ì˜ ? ì‚¬??ê³„ì‚° (?’ì? confidenceë¥?ê°€ì§?ê´€???„ì£¼ë¡?"""
+  142:     if pose1.shape[0] == 0 or pose2.shape[0] == 0:
+  143:         return 0.0
+  144:     
+  145:     # ?‘ìª½ ëª¨ë‘ confidenceê°€ ?’ì? ê´€?ˆë§Œ ?¬ìš©
+  146:     valid_mask = (scores1 > 0.3) & (scores2 > 0.3)
+  147:     if valid_mask.sum() < 3:  # ìµœì†Œ 3ê°?ê´€?ˆì? ?„ìš”
+  148:         return 0.0
+  149:     
+  150:     p1_valid = pose1[valid_mask]
+  151:     p2_valid = pose2[valid_mask]
+  152:     
+  153:     # ?¬ì¦ˆ??ì¤‘ì‹¬?ìœ¼ë¡??•ê·œ??
+  154:     c1 = np.mean(p1_valid, axis=0)
+  155:     c2 = np.mean(p2_valid, axis=0)
+  156:     
+  157:     p1_centered = p1_valid - c1
+  158:     p2_centered = p2_valid - c2
+  159:     
+  160:     # ?¬ê¸°ë¡??•ê·œ??
+  161:     scale1 = np.std(p1_centered)
+  162:     scale2 = np.std(p2_centered)
+  163:     
+  164:     if scale1 < 1e-6 or scale2 < 1e-6:
+  165:         return 0.0
+  166:     
+  167:     p1_norm = p1_centered / scale1
+  168:     p2_norm = p2_centered / scale2
+  169:     
+  170:     # ? í´ë¦¬ë“œ ê±°ë¦¬ ê¸°ë°˜ ? ì‚¬??
+  171:     distances = np.linalg.norm(p1_norm - p2_norm, axis=1)
+  172:     similarity = np.exp(-np.mean(distances))
+  173:     
+  174:     return similarity
+  175: 
+  176: 
+  177: def match_people_advanced(people0: List[Dict[str, np.ndarray]], people1: List[Dict[str, np.ndarray]]) -> List[Tuple[int, int]]:
+  178:     """ê°œì„ ???¬ëŒ ë§¤ì¹­ ?Œê³ ë¦¬ì¦˜"""
+  179:     if len(people0) == 0 or len(people1) == 0:
+  180:         return []
+  181:     
+  182:     n0, n1 = len(people0), len(people1)
+  183:     
+  184:     # ? ì‚¬???‰ë ¬ ê³„ì‚°
+  185:     similarity_matrix = np.zeros((n0, n1))
+  186:     
+  187:     for i, p0 in enumerate(people0):
+  188:         for j, p1 in enumerate(people1):
+  189:             sim = compute_pose_similarity(
+  190:                 p0["keypoints"], p1["keypoints"],
+  191:                 p0["scores"], p1["scores"]
+  192:             )
+  193:             similarity_matrix[i, j] = sim
+  194:     
+  195:     # ?ê?ë¦¬ì•ˆ ?Œê³ ë¦¬ì¦˜?¼ë¡œ ìµœì  ë§¤ì¹­
+  196:     # similarityë¥?costë¡?ë°”ê¾¸ê¸??„í•´ 1?ì„œ ë¹¼ê¸° (?? ?ˆë¬´ ?‘ì? ê°’ì? ?œì™¸)
+  197:     cost_matrix = 1 - similarity_matrix
+  198:     
+  199:     # ?ˆë¬´ ??? ? ì‚¬?„ëŠ” ë§¤ì¹­?ì„œ ?œì™¸
+  200:     cost_matrix[similarity_matrix < 0.1] = 1e6
+  201:     
+  202:     row_ind, col_ind = linear_sum_assignment(cost_matrix)
+  203:     
+  204:     # ? íš¨??ë§¤ì¹­ë§?ë°˜í™˜
+  205:     matches = []
+  206:     for r, c in zip(row_ind, col_ind):
+  207:         if cost_matrix[r, c] < 1e5:  # ? íš¨??ë§¤ì¹­
+  208:             matches.append((r, c))
+  209:     
+  210:     return matches
+  211: 
+  212: 
+  213: def smooth_3d_pose(current_pose: np.ndarray, prev_pose: Optional[np.ndarray], 
+  214:                    current_scores: np.ndarray, alpha: float = 0.7) -> np.ndarray:
+  215:     """3D ?¬ì¦ˆ ?œê°„???¤ë¬´??""
+  216:     if prev_pose is None:
+  217:         return current_pose
+  218:     
+  219:     # confidenceê°€ ??? ê´€?ˆì? ?´ì „ ?„ë ˆ??ê°’ì„ ??ë§ì´ ?¬ìš©
+  220:     weights = np.clip(current_scores, 0.1, 1.0).reshape(-1, 1)
+  221:     smoothed = alpha * current_pose + (1 - alpha) * prev_pose
+  222:     
+  223:     # confidence???°ë¼ ê°€ì¤??‰ê· 
+  224:     final_pose = weights * current_pose + (1 - weights) * smoothed
+  225:     
+  226:     return final_pose
+  227: 
+  228: 
+  229: def filter_outlier_joints(pose_3d: np.ndarray, scores: np.ndarray, threshold: float = 3.0) -> Tuple[np.ndarray, np.ndarray]:
+  230:     """?µê³„???´ìƒì¹??œê±°"""
+  231:     if pose_3d.shape[0] < 5:  # ê´€?ˆì´ ?ˆë¬´ ?ìœ¼ë©??„í„°ë§??ˆí•¨
+  232:         return pose_3d, scores
+  233:     
+  234:     # ?¬ì¦ˆ ì¤‘ì‹¬??ê³„ì‚°
+  235:     valid_mask = scores > 0.3
+  236:     if valid_mask.sum() < 3:
+  237:         return pose_3d, scores
+  238:     
+  239:     center = np.mean(pose_3d[valid_mask], axis=0)
+  240:     distances = np.linalg.norm(pose_3d - center, axis=1)
+  241:     
+  242:     # ì¤‘ìœ„?˜ì? MAD ê¸°ë°˜ ?´ìƒì¹?ê²€ì¶?
+  243:     median_dist = np.median(distances[valid_mask])
+  244:     mad = np.median(np.abs(distances[valid_mask] - median_dist))
+  245:     
+  246:     if mad < 1e-6:
+  247:         return pose_3d, scores
+  248:     
+  249:     z_scores = (distances - median_dist) / (1.4826 * mad)  # MAD to std conversion
+  250:     outlier_mask = z_scores > threshold
+  251:     
+  252:     # ?´ìƒì¹˜ëŠ” confidence ?¬ê²Œ ê°ì†Œ
+  253:     scores_filtered = scores.copy()
+  254:     scores_filtered[outlier_mask] *= 0.1
+  255:     
+  256:     return pose_3d, scores_filtered
+  257: 
+  258: 
+  259: def build_projection(K: np.ndarray, R: np.ndarray, t: np.ndarray) -> np.ndarray:
+  260:     Rt = np.hstack([R, t.reshape(3, 1)])
+  261:     return K @ Rt
+  262: 
+  263: 
+  264: def main():
+  265:     ap = argparse.ArgumentParser()
+  266:     ap.add_argument("--calib-file", required=True)
+  267:     ap.add_argument("--cam1-json", dest="cam1_json", required=True)
+  268:     ap.add_argument("--cam2-json", dest="cam2_json", required=True)
+  269:     ap.add_argument("--output-file", required=True)
+  270:     ap.add_argument("--extrinsic-format", choices=["w2c", "c2w"], default="w2c")
+  271:     ap.add_argument("--conf-thr", type=float, default=0.4)  # ?’ì¸ ê¸°ë³¸ê°?
+  272:     ap.add_argument("--no-undistort", action="store_true")
+  273:     ap.add_argument("--frame-offset", type=int, default=0)
+  274:     ap.add_argument("--max-persons", type=int, default=3)
+  275:     ap.add_argument("--reproj-stat", action="store_true")
+  276:     ap.add_argument("--smooth-alpha", type=float, default=0.7, 
+  277:                     help="?œê°„???¤ë¬´??ê³„ìˆ˜ (0-1, ?’ì„?˜ë¡ ?„ì¬ ?„ë ˆ??ì¤‘ì‹œ)")
+  278:     ap.add_argument("--outlier-threshold", type=float, default=2.5,
+  279:                     help="?´ìƒì¹?ê²€ì¶??„ê³„ê°?)
+  280:     args = ap.parse_args()
+  281: 
+  282:     print("Loading calibration...")
+  283:     K0, d0, K1, d1, Rrel, trel = parse_calib(args.calib_file, args.extrinsic_format)
+  284: 
+  285:     print("Loading video JSONs...")
+  286:     frames0 = load_json_video(args.cam1_json)
+  287:     frames1 = load_json_video(args.cam2_json)
+  288: 
+  289:     n = min(len(frames0), len(frames1) - args.frame_offset)
+  290:     if n <= 0:
+  291:         raise RuntimeError("No overlapping frames.")
+  292:     print(f"Total overlapping frames: {n}")
+  293: 
+  294:     P0 = build_projection(K0, np.eye(3, dtype=np.float64), np.zeros(3))
+  295:     P1 = build_projection(K1, Rrel.astype(np.float64), trel.astype(np.float64))
+  296: 
+  297:     results_out: List[Dict[str, Any]] = []
+  298:     prev_poses_3d: List[np.ndarray] = []  # ?´ì „ ?„ë ˆ??3D ?¬ì¦ˆ??
+  299: 
+  300:     for i in range(n):
+  301:         people0 = frames0[i]
+  302:         people1 = frames1[i + args.frame_offset]
+  303: 
+  304:         # ê°œì„ ??ë§¤ì¹­ ?Œê³ ë¦¬ì¦˜ ?¬ìš©
+  305:         pairs = match_people_advanced(people0, people1)
+  306:         if args.max_persons > 0:
+  307:             pairs = pairs[:args.max_persons]
+  308: 
+  309:         persons_out = []
+  310:         current_poses_3d = []
+  311: 
+  312:         for pair_idx, (i0, i1) in enumerate(pairs):
+  313:             k0 = people0[i0]["keypoints"].copy()
+  314:             s0 = people0[i0]["scores"].copy()
+  315:             k1 = people1[i1]["keypoints"].copy()
+  316:             s1 = people1[i1]["scores"].copy()
+  317: 
+  318:             # ???„ê²©??confidence ?„í„°ë§?
+  319:             conf = np.minimum(s0, s1)
+  320:             mask = (s0 > args.conf_thr) & (s1 > args.conf_thr)
+  321: 
+  322:             J = k0.shape[0]
+  323:             joints3d = np.full((J, 3), np.nan, dtype=np.float32)
+  324:             scores = np.zeros((J,), dtype=np.float32)
+  325: 
+  326:             # ?¼ê°ì¸¡ëŸ‰
+  327:             if mask.sum() > 0:
+  328:                 p0 = k0[mask]
+  329:                 p1 = k1[mask]
+  330:                 if not args.no_undistort:
+  331:                     p0 = undistort_pts(p0, K0, d0)
+  332:                     p1 = undistort_pts(p1, K1, d1)
+  333:                 
+  334:                 X, valid_mask = triangulate_robust(P0, P1, p0, p1)
+  335:                 
+  336:                 idxs = np.where(mask)[0]
+  337:                 if valid_mask.sum() > 0:
+  338:                     joints3d[idxs[valid_mask], :] = X[valid_mask]
+  339:                     scores[idxs[valid_mask]] = conf[idxs[valid_mask]]
+  340: 
+  341:             # NaN ì²˜ë¦¬ ë°??¤ë¬´??
+  342:             valid_joints = ~np.isnan(joints3d).any(axis=1)
+  343:             if valid_joints.sum() > 0:
+  344:                 # ?´ìƒì¹??„í„°ë§?
+  345:                 joints3d, scores = filter_outlier_joints(joints3d, scores, args.outlier_threshold)
+  346:                 
+  347:                 # ?œê°„???¤ë¬´??
+  348:                 prev_pose = prev_poses_3d[pair_idx] if pair_idx < len(prev_poses_3d) else None
+  349:                 if prev_pose is not None and valid_joints.sum() > 3:
+  350:                     joints3d[valid_joints] = smooth_3d_pose(
+  351:                         joints3d[valid_joints], prev_pose[valid_joints], 
+  352:                         scores[valid_joints], args.smooth_alpha
+  353:                     )
+  354: 
+  355:             # ìµœì¢… NaN ì²˜ë¦¬
+  356:             joints3d = np.nan_to_num(joints3d, nan=0.0)
+  357:             scores = np.nan_to_num(scores, nan=0.0)
+  358: 
+  359:             current_poses_3d.append(joints3d.copy())
+  360:             persons_out.append({
+  361:                 "keypoints_3d": joints3d.tolist(),
+  362:                 "scores": scores.tolist(),
+  363:                 "ok": True
+  364:             })
+  365: 
+  366:         # ?´ì „ ?„ë ˆ???•ë³´ ?…ë°?´íŠ¸
+  367:         prev_poses_3d = current_poses_3d
+  368: 
+  369:         results_out.append({
+  370:             "frame": i,
+  371:             "num_persons": len(persons_out),
+  372:             "persons": persons_out
+  373:         })
+  374: 
+  375:         if i % 50 == 0:
+  376:             print(f"Processed frame {i}/{n}")
+  377: 
+  378:     out = {
+  379:         "meta": {
+  380:             "skeleton": "coco17",
+  381:             "ref_cam": "cam0",
+  382:             "extrinsic_format": args.extrinsic_format,
+  383:             "improved_matching": True,
+  384:             "temporal_smoothing": args.smooth_alpha
+  385:         },
+  386:         "results": results_out
+  387:     }
+  388: 
+  389:     Path(args.output_file).parent.mkdir(parents=True, exist_ok=True)
+  390:     with open(args.output_file, "w", encoding="utf-8") as f:
+  391:         json.dump(out, f, ensure_ascii=False, indent=2)
+  392: 
+  393:     print(f"Saved: {args.output_file}")
+  394: 
+  395: 
+  396: if __name__ == "__main__":
+  397:     main()
+  398: 

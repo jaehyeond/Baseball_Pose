@@ -1,0 +1,431 @@
+    1: #!/usr/bin/env python3
+    2: """
+    3: Final 3D visualization for triangulated video results (multi-person overlay).
+    4: 
+    5: Usage example:
+    6:   python scripts/visualize_final_3d.py \
+    7:     --input D:\mmpose\output_3d\azure_kinect_3d_results_new.json \
+    8:     --out-dir D:\mmpose\vis3d_overlay \
+    9:     --azim -45 --elev 20 --axis-limit 1.8 \
+   10:     --axis-order xzy --flip-z --start 0 --end -1
+   11:   Í≥†Ï†ï ?âÏÉÅ(?ºÏ™Ω ?åÎûë/?§Î•∏Ï™?Îπ®Í∞ï)Í≥??êÎèô Ï§ëÏã¨/?§Ï???
+   12:   python scripts/visualize_final_3d.py \
+   13:     --input <json> --out-dir <dir> --azim -45 --elev 20 \
+   14:     --axis-order xzy --flip-z --center-mode auto --scale 1.25 --color-mode lr
+   15: """
+   16: import json
+   17: import numpy as np
+   18: import matplotlib.pyplot as plt
+   19: from mpl_toolkits.mplot3d import Axes3D
+   20: from pathlib import Path
+   21: import argparse
+   22: from scipy.spatial.distance import cdist
+   23: 
+   24: # Global variables for person tracking
+   25: person_tracker = {}  # {person_id: {'center': [x, y, z], 'color': 'blue'}}
+   26: color_palette = ['blue', 'red', 'green', 'orange', 'purple', 'cyan']
+   27: next_person_id = 0
+   28: 
+   29: # COCO-17 skeleton connections
+   30: SKELETON_EDGES = [
+   31:     (0, 1), (0, 2),  # nose to eyes
+   32:     (1, 3), (2, 4),  # eyes to ears
+   33:     (0, 5), (0, 6),  # nose to shoulders 
+   34:     (5, 7), (7, 9),  # left arm
+   35:     (6, 8), (8, 10), # right arm
+   36:     (5, 6),          # shoulders
+   37:     (5, 11), (6, 12), # shoulders to hips
+   38:     (11, 12),        # hips
+   39:     (11, 13), (13, 15), # left leg
+   40:     (12, 14), (14, 16)  # right leg
+   41: ]
+   42: 
+   43: def draw_skeleton_3d_final(ax, kpts_3d, scores, color='red', alpha=0.8, point_size=30, conf_threshold=0.3):
+   44:     """Draw skeleton with proper NaN handling"""
+   45:     if len(kpts_3d) != 17 or len(scores) != 17:
+   46:         return 0, 0
+   47:     
+   48:     kpts_3d = np.array(kpts_3d)
+   49:     scores = np.array(scores)
+   50:     
+   51:     # Find valid joints: high confidence AND no NaN values
+   52:     valid_joints = []
+   53:     for i in range(17):
+   54:         if (scores[i] > conf_threshold and 
+   55:             np.isfinite(kpts_3d[i, 0]) and 
+   56:             np.isfinite(kpts_3d[i, 1]) and 
+   57:             np.isfinite(kpts_3d[i, 2])):
+   58:             valid_joints.append(i)
+   59:     
+   60:     # print(f"    Valid joints (conf > {conf_threshold}, no NaN): {len(valid_joints)}")
+   61:     
+   62:     # Draw keypoints
+   63:     if len(valid_joints) > 0:
+   64:         valid_points = kpts_3d[valid_joints]
+   65:         ax.scatter(valid_points[:, 0], valid_points[:, 1], valid_points[:, 2],
+   66:                   s=point_size, c=color, alpha=alpha, depthshade=True, marker='o')
+   67:     
+   68:     # Draw skeleton connections
+   69:     connections_drawn = 0
+   70:     for i, j in SKELETON_EDGES:
+   71:         if i in valid_joints and j in valid_joints:
+   72:             pt1, pt2 = kpts_3d[i], kpts_3d[j]
+   73:             
+   74:             xs = [pt1[0], pt2[0]]
+   75:             ys = [pt1[1], pt2[1]]
+   76:             zs = [pt1[2], pt2[2]]
+   77:             ax.plot(xs, ys, zs, color=color, linewidth=4, alpha=alpha)
+   78:             connections_drawn += 1
+   79:     
+   80:     # print(f"    Drew {connections_drawn} skeleton connections")
+   81:     return len(valid_joints), connections_drawn
+   82: 
+   83: def setup_3d_axes_safe(ax, center_point=None, range_meters=2.0, azim=45, elev=20):
+   84:     """Setup 3D axes with safe defaults and proper centering"""
+   85:     if center_point is None:
+   86:         center_point = [0, 0, 1.0]
+   87:     
+   88:     # Use safe, finite limits with proper centering
+   89:     x_center, y_center, z_center = center_point
+   90:     half_range = range_meters / 2
+   91:     
+   92:     # Center the skeleton properly in all axes, including Z
+   93:     ax.set_xlim(x_center - half_range, x_center + half_range)
+   94:     ax.set_ylim(y_center - half_range, y_center + half_range)
+   95:     ax.set_zlim(z_center - half_range, z_center + half_range)
+   96:     
+   97:     ax.set_xlabel('X (meters)', fontsize=10)
+   98:     ax.set_ylabel('Y (meters)', fontsize=10)
+   99:     ax.set_zlabel('Z (meters)', fontsize=10)
+  100:     
+  101:     ax.view_init(elev=elev, azim=azim)
+  102:     ax.grid(True, alpha=0.3)
+  103:     
+  104:     # Clean axes appearance
+  105:     ax.xaxis.pane.fill = False
+  106:     ax.yaxis.pane.fill = False
+  107:     ax.zaxis.pane.fill = False
+  108:     ax.xaxis.pane.set_alpha(0.1)
+  109:     ax.yaxis.pane.set_alpha(0.1)
+  110:     ax.zaxis.pane.set_alpha(0.1)
+  111: 
+  112: def _apply_axis_transform(k3d, order='xyz', flip_z=False):
+  113:     arr = np.asarray(k3d, dtype=float)
+  114:     if arr.ndim != 2 or arr.shape[1] < 3:
+  115:         return arr
+  116:     idx_map = {
+  117:         'xyz': (0, 1, 2),
+  118:         'xzy': (0, 2, 1),
+  119:         'yxz': (1, 0, 2),
+  120:         'yzx': (1, 2, 0),
+  121:         'zxy': (2, 0, 1),
+  122:         'zyx': (2, 1, 0),
+  123:     }
+  124:     idx = idx_map.get(order, (0, 1, 2))
+  125:     xyz = arr[:, idx].copy()
+  126:     if flip_z:
+  127:         xyz[:, 2] = -xyz[:, 2]
+  128:     if arr.shape[1] > 3:
+  129:         arr2 = np.concatenate([xyz, arr[:, 3:4]], axis=1)
+  130:     else:
+  131:         arr2 = xyz
+  132:     return arr2
+  133: 
+  134: 
+  135: def calculate_global_bounds(all_results, axis_order='xyz', flip_z=False, kpt_thr=0.3):
+  136:     """Calculate global bounds across all frames for consistent visualization"""
+  137:     all_points = []
+  138:     
+  139:     for frame_data in all_results:
+  140:         persons = frame_data.get('persons', [])
+  141:         for person in persons:
+  142:             arr = np.array(person.get('keypoints_3d', person.get('joints_3d')))
+  143:             arr = _apply_axis_transform(arr, order=axis_order, flip_z=flip_z)
+  144:             scores = (arr[:, 3] if arr.shape[1] > 3 else np.ones((arr.shape[0],), dtype=float))
+  145:             mask = (scores > kpt_thr) & np.isfinite(arr[:, :3]).all(axis=1)
+  146:             if np.any(mask):
+  147:                 all_points.append(arr[mask, :3])
+  148:     
+  149:     if len(all_points) > 0:
+  150:         pts = np.concatenate(all_points, axis=0)
+  151:         pmin = np.min(pts, axis=0)
+  152:         pmax = np.max(pts, axis=0)
+  153:         center_point = (pmin + pmax) / 2.0
+  154:         # Í∏∞Ï°¥ ?∞Î™®?Ä ?ôÏùº???®Îî© Î∞©Ïãù ?ÅÏö©
+  155:         max_range = max(pmax[0] - pmin[0], pmax[1] - pmin[1], pmax[2] - pmin[2])
+  156:         if max_range < 1.0:
+  157:             max_range = 1.0
+  158:         padding = max_range * 0.2  # 20% ?®Îî© (?§Ïºà?àÌÜ§??Ï°∞Í∏à ???¨Í≤å)
+  159:         range_meters = max_range + padding
+  160:         return center_point, range_meters
+  161:     else:
+  162:         return [0, 0, 1.0], 2.0
+  163: 
+  164: 
+  165: def assign_person_ids(persons, axis_order='xyz', flip_z=False, kpt_thr=0.3):
+  166:     """Assign consistent IDs to persons based on position tracking"""
+  167:     global person_tracker, next_person_id
+  168:     
+  169:     # Calculate center position for each person in current frame
+  170:     current_persons = []
+  171:     for i, person in enumerate(persons):
+  172:         arr = np.array(person.get('keypoints_3d', person.get('joints_3d')))
+  173:         arr = _apply_axis_transform(arr, order=axis_order, flip_z=flip_z)
+  174:         scores = (arr[:, 3] if arr.shape[1] > 3 else np.ones((arr.shape[0],), dtype=float))
+  175:         
+  176:         # Find valid joints
+  177:         valid_mask = (scores > kpt_thr) & np.isfinite(arr[:, :3]).all(axis=1)
+  178:         if np.any(valid_mask):
+  179:             valid_points = arr[valid_mask, :3]
+  180:             center = np.mean(valid_points, axis=0)
+  181:             current_persons.append({
+  182:                 'index': i,
+  183:                 'center': center,
+  184:                 'person_data': person
+  185:             })
+  186:     
+  187:     if not current_persons:
+  188:         return []
+  189:     
+  190:     # If no previous tracking data, assign new IDs
+  191:     if not person_tracker:
+  192:         assigned_persons = []
+  193:         for i, person_info in enumerate(current_persons):
+  194:             person_id = next_person_id
+  195:             next_person_id += 1
+  196:             color = color_palette[i % len(color_palette)]
+  197:             
+  198:             person_tracker[person_id] = {
+  199:                 'center': person_info['center'].copy(),
+  200:                 'color': color
+  201:             }
+  202:             
+  203:             assigned_persons.append({
+  204:                 'id': person_id,
+  205:                 'color': color,
+  206:                 'data': person_info['person_data']
+  207:             })
+  208:         return assigned_persons
+  209:     
+  210:     # Match current persons to previous ones based on distance
+  211:     current_centers = np.array([p['center'] for p in current_persons])
+  212:     previous_centers = np.array([person_tracker[pid]['center'] for pid in person_tracker.keys()])
+  213:     previous_ids = list(person_tracker.keys())
+  214:     
+  215:     # Calculate distance matrix
+  216:     if len(previous_centers) > 0:
+  217:         distances = cdist(current_centers, previous_centers)
+  218:         
+  219:         # Hungarian algorithm-like assignment (simple greedy for now)
+  220:         assigned_persons = []
+  221:         used_ids = set()
+  222:         
+  223:         # Sort current persons by minimum distance to any previous person
+  224:         person_indices = list(range(len(current_persons)))
+  225:         person_indices.sort(key=lambda i: np.min(distances[i]))
+  226:         
+  227:         for curr_idx in person_indices:
+  228:             person_info = current_persons[curr_idx]
+  229:             
+  230:             # Find closest previous person that hasn't been assigned
+  231:             available_ids = [i for i, pid in enumerate(previous_ids) if pid not in used_ids]
+  232:             if available_ids:
+  233:                 closest_prev_idx = available_ids[np.argmin(distances[curr_idx, available_ids])]
+  234:                 person_id = previous_ids[closest_prev_idx]
+  235:                 used_ids.add(person_id)
+  236:                 
+  237:                 # Update tracker with new position
+  238:                 person_tracker[person_id]['center'] = person_info['center'].copy()
+  239:                 
+  240:                 assigned_persons.append({
+  241:                     'id': person_id,
+  242:                     'color': person_tracker[person_id]['color'],
+  243:                     'data': person_info['person_data']
+  244:                 })
+  245:             else:
+  246:                 # New person - assign new ID
+  247:                 person_id = next_person_id
+  248:                 next_person_id += 1
+  249:                 # Use next available color
+  250:                 used_colors = [person_tracker[pid]['color'] for pid in used_ids]
+  251:                 available_colors = [c for c in color_palette if c not in used_colors]
+  252:                 color = available_colors[0] if available_colors else color_palette[person_id % len(color_palette)]
+  253:                 
+  254:                 person_tracker[person_id] = {
+  255:                     'center': person_info['center'].copy(),
+  256:                     'color': color
+  257:                 }
+  258:                 
+  259:                 assigned_persons.append({
+  260:                     'id': person_id,
+  261:                     'color': color,
+  262:                     'data': person_info['person_data']
+  263:                 })
+  264:         
+  265:         return assigned_persons
+  266:     else:
+  267:         # Fresh start
+  268:         return assign_person_ids(persons, axis_order, flip_z, kpt_thr)
+  269: 
+  270: 
+  271: def visualize_frame_final(frame_data, frame_idx, output_dir,
+  272:                           azim=45, elev=20, axis_limit=None,
+  273:                           axis_order='xyz', flip_z=False, kpt_thr=0.3,
+  274:                           center_mode='auto', scale=1.2,
+  275:                           color_mode='index',
+  276:                           global_center=None, global_range=None):
+  277:     """Visualize frame with robust error handling (overlay all persons)"""
+  278:     fig = plt.figure(figsize=(14, 10))
+  279:     ax = fig.add_subplot(111, projection='3d')
+  280:     
+  281:     persons = frame_data.get('persons', [])
+  282:     num_persons = len(persons)
+  283:     
+  284:     # Assign consistent person IDs and colors
+  285:     assigned_persons = assign_person_ids(persons, axis_order, flip_z, kpt_thr)
+  286:     
+  287:     print(f"Frame {frame_idx}: {num_persons} persons")
+  288:     
+  289:     # Calculate safe center point from all valid joints
+  290:     all_valid_points = []
+  291:     for person_info in assigned_persons:
+  292:         person = person_info['data']
+  293:         arr = np.array(person.get('keypoints_3d', person.get('joints_3d')))
+  294:         arr = _apply_axis_transform(arr, order=axis_order, flip_z=flip_z)
+  295:         scores = (arr[:, 3] if arr.shape[1] > 3 else np.ones((arr.shape[0],), dtype=float))
+  296:         mask = (scores > kpt_thr) & np.isfinite(arr[:, :3]).all(axis=1)
+  297:         if np.any(mask):
+  298:             all_valid_points.append(arr[mask, :3])
+  299:     
+  300:     # Use global bounds for consistent axes across all frames
+  301:     if global_center is not None and global_range is not None:
+  302:         center_point = global_center
+  303:         range_meters = global_range
+  304:     elif len(all_valid_points) > 0:
+  305:         # Fallback to frame-based calculation if no global bounds provided
+  306:         pts = np.concatenate(all_valid_points, axis=0)
+  307:         if center_mode == 'bbox':
+  308:             pmin = np.min(pts, axis=0)
+  309:             pmax = np.max(pts, axis=0)
+  310:             center_point = (pmin + pmax) / 2.0
+  311:             ranges = pmax - pmin
+  312:             ranges = ranges * 1.1
+  313:         else:
+  314:             center_point = np.mean(pts, axis=0)
+  315:             ranges = np.ptp(pts, axis=0)
+  316:             ranges = ranges * 1.1
+  317:         max_range = np.max(ranges)
+  318:         range_meters = max(2.5, max_range * float(scale) * 1.3)
+  319:     else:
+  320:         center_point = [0, 0, 1.0]
+  321:         range_meters = 2.8
+  322:     
+  323:     # Draw each person with consistent colors
+  324:     total_joints = 0
+  325:     total_connections = 0
+  326: 
+  327:     for person_info in assigned_persons:
+  328:         person = person_info['data']
+  329:         person_id = person_info['id']
+  330:         color = person_info['color']
+  331:         
+  332:         arr = np.array(person.get('keypoints_3d', person.get('joints_3d')))
+  333:         arr = _apply_axis_transform(arr, order=axis_order, flip_z=flip_z)
+  334:         scores = (arr[:, 3] if arr.shape[1] > 3 else np.ones((arr.shape[0],), dtype=float))
+  335:         kpts_3d = np.concatenate([arr[:, :3], scores.reshape(-1, 1)], axis=1)
+  336: 
+  337:         print(f"  Drawing Person ID {person_id} with {color}:")
+  338:         valid_joints, connections = draw_skeleton_3d_final(
+  339:             ax, kpts_3d, scores, color=color, alpha=0.8, conf_threshold=kpt_thr
+  340:         )
+  341:         
+  342:         total_joints += valid_joints
+  343:         total_connections += connections
+  344:         
+  345:         # Add person label near highest valid point
+  346:         kpts_array = np.array(kpts_3d)
+  347:         scores_array = np.array(scores)
+  348:         
+  349:         valid_mask = (scores_array > 0.3) & np.isfinite(kpts_array).all(axis=1)
+  350:         if np.any(valid_mask):
+  351:             valid_kpts = kpts_array[valid_mask]
+  352:             highest_point = valid_kpts[np.argmax(valid_kpts[:, 2])]  # Highest Z
+  353:             
+  354:             ax.text(highest_point[0], highest_point[1], highest_point[2] + 0.1,
+  355:                    f'Person {person_id}', fontsize=12, color=color, weight='bold',
+  356:                    bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+  357:     
+  358:     # Use requested axis limit if provided
+  359:     if axis_limit is not None:
+  360:         range_meters = axis_limit
+  361:     setup_3d_axes_safe(ax, center_point, range_meters, azim=azim, elev=elev)
+  362:     
+  363:     title = f'Video 3D Pose (Frame {frame_idx}) | {len(assigned_persons)} Persons | {total_connections} Connections'
+  364:     plt.title(title, fontsize=14, weight='bold', pad=20)
+  365:     
+  366:     # Save with high quality
+  367:     output_path = Path(output_dir) / f'final_frame_{frame_idx:04d}.png'
+  368:     plt.savefig(output_path, dpi=300, bbox_inches='tight', 
+  369:                 facecolor='white', edgecolor='none')
+  370:     plt.close()
+  371:     
+  372:     return output_path, total_joints, total_connections
+  373: 
+  374: def main():
+  375:     global person_tracker, next_person_id
+  376:     
+  377:     parser = argparse.ArgumentParser()
+  378:     parser.add_argument('--input', required=True, help='Path to 3D JSON results')
+  379:     parser.add_argument('--out-dir', required=True, help='Directory to save PNGs')
+  380:     parser.add_argument('--start', type=int, default=0, help='Start frame index')
+  381:     parser.add_argument('--end', type=int, default=-1, help='End frame index (inclusive), -1 for all')
+  382:     parser.add_argument('--azim', type=float, default=45)
+  383:     parser.add_argument('--elev', type=float, default=20)
+  384:     parser.add_argument('--axis-limit', type=float, default=None, help=r'Í∞ïÏ†ú Î∞ïÏä§ ?¨Í∏∞(m). ?ÜÏúºÎ©??êÎèô')
+  385:     parser.add_argument('--axis-order', type=str, default='xyz', choices=['xyz','xzy','yxz','yzx','zxy','zyx'])
+  386:     parser.add_argument('--flip-z', action='store_true')
+  387:     parser.add_argument('--kpt-thr', type=float, default=0.3)
+  388:     parser.add_argument('--center-mode', type=str, default='auto', choices=['auto','bbox','index'], help='Ï∂?Ï§ëÏã¨ Í≥ÑÏÇ∞ Î∞©Ïãù')
+  389:     parser.add_argument('--scale', type=float, default=1.2, help='?êÎèô ?§Ï??????¨Ïú† Î∞∞Ïú®(>1.0)')
+  390:     parser.add_argument('--color-mode', type=str, default='lr', choices=['lr','index','fixed'], help='?¨Îûå ?âÏÉÅ Îß§Ìïë: lr=Ï¢???Í≥†Ï†ï(?åÎûë/Îπ®Í∞ï)')
+  391:     args = parser.parse_args()
+  392: 
+  393:     # Initialize person tracking
+  394:     person_tracker = {}
+  395:     next_person_id = 0
+  396:     
+  397:     with open(args.input, 'r', encoding='utf-8') as f:
+  398:         data = json.load(f)
+  399:     results = data['results']
+  400:     out_dir = Path(args.out_dir)
+  401:     out_dir.mkdir(parents=True, exist_ok=True)
+  402: 
+  403:     end_idx = len(results) - 1 if args.end < 0 or args.end >= len(results) else args.end
+  404: 
+  405:     # Calculate global bounds for consistent visualization axes
+  406:     frames_to_process = results[args.start:end_idx + 1]
+  407:     global_center, global_range = calculate_global_bounds(
+  408:         frames_to_process, args.axis_order, args.flip_z, args.kpt_thr
+  409:     )
+  410:     
+  411:     print(f"Global center: {global_center}, Global range: {global_range}")
+  412: 
+  413:     for idx in range(args.start, end_idx + 1):
+  414:         frame = results[idx]
+  415:         frame_idx = frame.get('frame', frame.get('frame_index', idx))
+  416:         visualize_frame_final(frame, frame_idx, out_dir,
+  417:                               azim=args.azim, elev=args.elev,
+  418:                               axis_limit=args.axis_limit,
+  419:                               axis_order=args.axis_order,
+  420:                               flip_z=args.flip_z,
+  421:                               kpt_thr=args.kpt_thr,
+  422:                               center_mode=args.center_mode,
+  423:                               scale=args.scale,
+  424:                               color_mode=args.color_mode,
+  425:                               global_center=global_center,
+  426:                               global_range=global_range)
+  427: 
+  428:     print(f'Saved frames {args.start}..{end_idx} to {out_dir}')
+  429: 
+  430: if __name__ == "__main__":
+  431:     main()

@@ -1,0 +1,16 @@
+[calibration 폴더]
+- azure_kinect_calibration.json > 최근에 촬영한 캘리브레이션
+
+[frames 폴더]
+- Camera1 / Camera2 > 최근 촬영본
+
+[demo 폴더]
+- inferencer_demo.py > 2d 포즈(+3d 추출까지도 있음-리프팅) 추출
+- topdown_demo_with_mmdet.py > 2d 포즈(만) 추출
+
+- azure_kinect_3d_visualization_demo.py > 3d JSON 파일 시각화 코드
+ : 사용된 3d JSON 파일 - azure_kinect_3d_results.json [output_3d 폴더]
+ : 결과 - vis3d_front 폴더 (성공적)
+- azure_kinect_3d_visualization_demo_video.py > 3d JSON 파일 시각화 코드
+ : 사용된 3d JSON 파일 - azure_kinect_3d_results_new.json [output_3d 폴더]
+ : 결과 - vis3d_final 폴더 (축 설정 이상함)
