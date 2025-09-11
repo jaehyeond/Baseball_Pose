@@ -15,7 +15,7 @@ from scipy import interpolate
 prev_centers = None  # [center_person0, center_person1]
 color_palette = ['red', 'blue', 'green', 'orange', 'purple', 'cyan']
 
-# COCO-17 skeleton connections (demo.py 방식)
+# COCO-17 skeleton connections (demo.py 방식 성공)
 SKELETON_EDGES = [
     (0,1),(1,2),(2,3),(3,4),
     (1,5),(5,7),(7,9),
